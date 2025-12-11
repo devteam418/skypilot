@@ -32,14 +32,17 @@ from sky.adaptors import common as adaptors_common
 from sky.client import common as client_common
 from sky.client import oauth as oauth_lib
 from sky.jobs import scheduler
+from sky.jobs import utils as managed_job_utils
 from sky.schemas.api import responses
 from sky.server import common as server_common
 from sky.server import rest
 from sky.server import versions
 from sky.server.requests import payloads
+from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
 from sky.skylet import autostop_lib
 from sky.skylet import constants
+from sky.ssh_node_pools import utils as ssh_utils
 from sky.usage import usage_lib
 from sky.utils import admin_policy_utils
 from sky.utils import annotations
@@ -55,7 +58,6 @@ from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
-from sky.utils.kubernetes import ssh_utils
 
 if typing.TYPE_CHECKING:
     import base64
@@ -380,6 +382,16 @@ def workspaces() -> server_common.RequestId[Dict[str, Any]]:
     return server_common.get_request_id(response)
 
 
+def _raise_exception_object_on_client(e: BaseException) -> None:
+    """Raise the exception object on the client."""
+    if env_options.Options.SHOW_DEBUG_INFO.get():
+        stacktrace = getattr(e, 'stacktrace', str(e))
+        logger.error('=== Traceback on SkyPilot API Server ===\n'
+                     f'{stacktrace}')
+    with ux_utils.print_exception_no_traceback():
+        raise e
+
+
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api
@@ -420,9 +432,8 @@ def validate(
     response = server_common.make_authenticated_request(
         'POST', '/validate', json=json.loads(body.model_dump_json()))
     if response.status_code == 400:
-        with ux_utils.print_exception_no_traceback():
-            raise exceptions.deserialize_exception(
-                response.json().get('detail'))
+        _raise_exception_object_on_client(
+            exceptions.deserialize_exception(response.json().get('detail')))
 
 
 @usage_lib.entrypoint
@@ -603,7 +614,10 @@ def launch(
         down=down,
         dryrun=dryrun)
     with admin_policy_utils.apply_and_use_config_in_current_request(
-            dag, request_options=request_options, at_client_side=True) as dag:
+            dag,
+            request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
+            request_options=request_options,
+            at_client_side=True) as dag:
         return _launch(
             dag,
             cluster_name,
@@ -661,7 +675,7 @@ def _launch(
         clusters = get(status_request_id)
         cluster_user_hash = common_utils.get_user_hash()
         cluster_user_hash_str = ''
-        current_user = common_utils.get_current_user_name()
+        current_user = common_utils.get_local_user_name()
         cluster_user_name = current_user
         if not clusters:
             # Show the optimize log before the prompt if the cluster does not
@@ -1698,12 +1712,6 @@ def storage_delete(name: str) -> server_common.RequestId[None]:
 @server_common.check_server_healthy_or_start
 @annotations.client_api
 def local_up(gpus: bool,
-             ips: Optional[List[str]],
-             ssh_user: Optional[str],
-             ssh_key: Optional[str],
-             cleanup: bool,
-             context_name: Optional[str] = None,
-             password: Optional[str] = None,
              name: Optional[str] = None,
              port_start: Optional[int] = None) -> server_common.RequestId[None]:
     """Launches a Kubernetes cluster on local machines.
@@ -1719,15 +1727,7 @@ def local_up(gpus: bool,
             raise ValueError('`sky local up` is only supported when '
                              'running SkyPilot locally.')
 
-    body = payloads.LocalUpBody(gpus=gpus,
-                                ips=ips,
-                                ssh_user=ssh_user,
-                                ssh_key=ssh_key,
-                                cleanup=cleanup,
-                                context_name=context_name,
-                                password=password,
-                                name=name,
-                                port_start=port_start)
+    body = payloads.LocalUpBody(gpus=gpus, name=name, port_start=port_start)
     response = server_common.make_authenticated_request(
         'POST', '/local_up', json=json.loads(body.model_dump_json()))
     return server_common.get_request_id(response)
@@ -1940,7 +1940,8 @@ def status_kubernetes() -> server_common.RequestId[
     Tuple[List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
           List['kubernetes_utils.KubernetesSkyPilotClusterInfoPayload'],
           List[responses.ManagedJobRecord], Optional[str]]]:
-    """Gets all SkyPilot clusters and jobs in the Kubernetes cluster.
+    """[Experimental] Gets all SkyPilot clusters and jobs
+    in the Kubernetes cluster.
 
     Managed jobs and services are also included in the clusters returned.
     The caller must parse the controllers to identify which clusters are run
@@ -2012,12 +2013,7 @@ def get(request_id: server_common.RequestId[T]) -> T:
     error = request_task.get_error()
     if error is not None:
         error_obj = error['object']
-        if env_options.Options.SHOW_DEBUG_INFO.get():
-            stacktrace = getattr(error_obj, 'stacktrace', str(error_obj))
-            logger.error('=== Traceback on SkyPilot API Server ===\n'
-                         f'{stacktrace}')
-        with ux_utils.print_exception_no_traceback():
-            raise error_obj
+        _raise_exception_object_on_client(error_obj)
     if request_task.status == requests_lib.RequestStatus.CANCELLED:
         with ux_utils.print_exception_no_traceback():
             raise exceptions.RequestCancelled(
@@ -2343,15 +2339,17 @@ def api_stop() -> None:
     with filelock.FileLock(
             os.path.expanduser(constants.API_SERVER_CREATION_LOCK_PATH)):
         try:
-            with open(os.path.expanduser(scheduler.JOB_CONTROLLER_PID_PATH),
-                      'r',
-                      encoding='utf-8') as f:
-                pids = f.read().split('\n')[:-1]
-                for pid in pids:
-                    if subprocess_utils.is_process_alive(int(pid.strip())):
-                        subprocess_utils.kill_children_processes(
-                            parent_pids=[int(pid.strip())], force=True)
-            os.remove(os.path.expanduser(scheduler.JOB_CONTROLLER_PID_PATH))
+            records = scheduler.get_controller_process_records()
+            if records is not None:
+                for record in records:
+                    try:
+                        if managed_job_utils.controller_process_alive(
+                                record, quiet=False):
+                            subprocess_utils.kill_children_processes(
+                                parent_pids=[record.pid], force=True)
+                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                        continue
+                os.remove(os.path.expanduser(scheduler.JOB_CONTROLLER_PID_PATH))
         except FileNotFoundError:
             # its fine we will create it
             pass
@@ -2746,3 +2744,57 @@ def api_logout() -> None:
     _clear_api_server_config()
     logger.info(f'{colorama.Fore.GREEN}Logged out of SkyPilot API server.'
                 f'{colorama.Style.RESET_ALL}')
+
+
+@usage_lib.entrypoint
+@server_common.check_server_healthy_or_start
+@versions.minimal_api_version(24)
+@annotations.client_api
+def realtime_slurm_gpu_availability(
+        name_filter: Optional[str] = None,
+        quantity_filter: Optional[int] = None) -> server_common.RequestId:
+    """Gets the real-time Slurm GPU availability.
+
+    Args:
+        name_filter: Optional name filter for GPUs.
+        quantity_filter: Optional quantity filter for GPUs.
+
+    Returns:
+        The request ID of the Slurm GPU availability request.
+    """
+    body = payloads.SlurmGpuAvailabilityRequestBody(
+        name_filter=name_filter,
+        quantity_filter=quantity_filter,
+    )
+    response = server_common.make_authenticated_request(
+        'POST',
+        '/slurm_gpu_availability',
+        json=json.loads(body.model_dump_json()),
+    )
+    return server_common.get_request_id(response)
+
+
+@usage_lib.entrypoint
+@server_common.check_server_healthy_or_start
+@versions.minimal_api_version(24)
+@annotations.client_api
+def slurm_node_info(
+        slurm_cluster_name: Optional[str] = None) -> server_common.RequestId:
+    """Gets the resource information for all nodes in the Slurm cluster.
+
+    Returns:
+        The request ID of the Slurm node info request.
+
+    Request Returns:
+        List[Dict[str, Any]]: A list of dictionaries, each containing info
+            for a single Slurm node (node_name, partition, node_state,
+            gpu_type, total_gpus, free_gpus, vcpu_count, memory_gb).
+    """
+    body = payloads.SlurmNodeInfoRequestBody(
+        slurm_cluster_name=slurm_cluster_name)
+    response = server_common.make_authenticated_request(
+        'GET',
+        '/slurm_node_info',
+        json=json.loads(body.model_dump_json()),
+    )
+    return server_common.get_request_id(response)

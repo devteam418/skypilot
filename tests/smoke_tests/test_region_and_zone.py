@@ -45,7 +45,7 @@ def test_aws_region():
     test = smoke_tests_utils.Test(
         'aws_region',
         [
-            f'sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra */us-east-2 examples/minimal.yaml',
+            f'sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra aws/us-east-2 examples/minimal.yaml',
             f'sky exec {name} examples/minimal.yaml',
             f'sky logs {name} 1 --status',  # Ensure the job succeeded.
             f'sky status -v | grep {name} | grep us-east-2',  # Ensure the region is correct.
@@ -243,6 +243,7 @@ def test_gcp_zone():
 @pytest.mark.no_shadeform  # Requires AWS
 @pytest.mark.no_seeweb  # Seeweb does not support storage mounting yet.
 @pytest.mark.no_dependency  # Requires full dependency installed
+@pytest.mark.no_slurm  # Slurm does not support docker images and/or image_id
 @pytest.mark.parametrize(
     'image_id',
     [

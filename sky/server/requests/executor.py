@@ -44,6 +44,7 @@ from sky.server import common as server_common
 from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import metrics as metrics_lib
+from sky.server import plugins
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
@@ -159,6 +160,8 @@ queue_backend = server_config.QueueBackend.MULTIPROCESSING
 def executor_initializer(proc_group: str):
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
+    # Load plugins for executor process.
+    plugins.load_plugins(plugins.ExtensionContext())
     # Executor never stops, unless the whole process is killed.
     threading.Thread(target=metrics_lib.process_monitor,
                      args=(f'worker:{proc_group}', threading.Event()),
@@ -230,6 +233,12 @@ class RequestWorker:
             fut = executor.submit_until_success(
                 _request_execution_wrapper, request_id, ignore_return_value,
                 self.num_db_connections_per_worker)
+            # Decrement the free executor count when a request starts
+            if metrics_utils.METRICS_ENABLED:
+                if self.schedule_type == api_requests.ScheduleType.LONG:
+                    metrics_utils.SKY_APISERVER_LONG_EXECUTORS.dec()
+                elif self.schedule_type == api_requests.ScheduleType.SHORT:
+                    metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.dec()
             # Monitor the result of the request execution.
             threading.Thread(target=self.handle_task_result,
                              args=(fut, request_element),
@@ -264,9 +273,23 @@ class RequestWorker:
                 queue.put(request_element)
         except exceptions.ExecutionRetryableError as e:
             time.sleep(e.retry_wait_seconds)
+            # Reset the request status to PENDING so it can be picked up again.
+            # Assume retryable since the error is ExecutionRetryableError.
+            request_id, _, _ = request_element
+            with api_requests.update_request(request_id) as request_task:
+                assert request_task is not None, request_id
+                request_task.status = api_requests.RequestStatus.PENDING
             # Reschedule the request.
             queue = _get_queue(self.schedule_type)
             queue.put(request_element)
+            logger.info(f'Rescheduled request {request_id} for retry')
+        finally:
+            # Increment the free executor count when a request finishes
+            if metrics_utils.METRICS_ENABLED:
+                if self.schedule_type == api_requests.ScheduleType.LONG:
+                    metrics_utils.SKY_APISERVER_LONG_EXECUTORS.inc()
+                elif self.schedule_type == api_requests.ScheduleType.SHORT:
+                    metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.inc()
 
     def run(self) -> None:
         # Handle the SIGTERM signal to abort the executor process gracefully.
@@ -288,6 +311,16 @@ class RequestWorker:
                 burst_workers=self.burstable_parallelism,
                 initializer=executor_initializer,
                 initargs=(proc_group,))
+            # Initialize the appropriate gauge for the number of free executors
+            total_executors = (self.garanteed_parallelism +
+                               self.burstable_parallelism)
+            if metrics_utils.METRICS_ENABLED:
+                if self.schedule_type == api_requests.ScheduleType.LONG:
+                    metrics_utils.SKY_APISERVER_LONG_EXECUTORS.set(
+                        total_executors)
+                elif self.schedule_type == api_requests.ScheduleType.SHORT:
+                    metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.set(
+                        total_executors)
             while not self._cancel_event.is_set():
                 self.process_request(executor, queue)
         # TODO(aylei): better to distinct between KeyboardInterrupt and SIGTERM.
@@ -503,8 +536,8 @@ def _request_execution_wrapper(request_id: str,
         # so that the "Request xxxx failed due to ..." log message will be
         # written to the original stdout and stderr file descriptors.
         _restore_output()
-        logger.info(f'Request {request_id} failed due to '
-                    f'{common_utils.format_exception(e)}')
+        logger.error(f'Request {request_id} failed due to '
+                     f'{common_utils.format_exception(e)}')
         return
     else:
         api_requests.set_request_succeeded(

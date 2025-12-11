@@ -33,6 +33,7 @@ from sky.server import daemons
 from sky.server.requests import payloads
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
+from sky.server.requests.serializers import return_value_serializers
 from sky.utils import asyncio_utils
 from sky.utils import common_utils
 from sky.utils import ux_utils
@@ -231,13 +232,16 @@ class Request:
         assert isinstance(self.request_body,
                           payloads.RequestBody), (self.name, self.request_body)
         try:
+            # Use version-aware serializer to handle backward compatibility
+            # for old clients that don't recognize new fields.
+            serializer = return_value_serializers.get_serializer(self.name)
             return payloads.RequestPayload(
                 request_id=self.request_id,
                 name=self.name,
                 entrypoint=encoders.pickle_and_encode(self.entrypoint),
                 request_body=encoders.pickle_and_encode(self.request_body),
                 status=self.status.value,
-                return_value=orjson.dumps(self.return_value).decode('utf-8'),
+                return_value=serializer(self.return_value),
                 error=orjson.dumps(self.error).decode('utf-8'),
                 pid=self.pid,
                 created_at=self.created_at,
@@ -556,8 +560,8 @@ def kill_cluster_requests(cluster_name: str, exclude_request_name: str):
     _kill_requests(request_ids)
 
 
-def kill_requests_with_prefix(request_ids: Optional[List[str]] = None,
-                              user_id: Optional[str] = None) -> List[str]:
+def kill_requests(request_ids: Optional[List[str]] = None,
+                  user_id: Optional[str] = None) -> List[str]:
     """Kill requests with a given request ID prefix."""
     expanded_request_ids: Optional[List[str]] = None
     if request_ids is not None:
@@ -572,6 +576,11 @@ def kill_requests_with_prefix(request_ids: Optional[List[str]] = None,
                                  f'request ID prefix: {request_id}')
             expanded_request_ids.append(request_tasks[0].request_id)
     return _kill_requests(request_ids=expanded_request_ids, user_id=user_id)
+
+
+# needed for backward compatibility. Remove by v0.10.7 or v0.12.0
+# and rename kill_requests to kill_requests_with_prefix.
+kill_requests_with_prefix = kill_requests
 
 
 def _should_kill_request(request_id: str,
@@ -1037,11 +1046,15 @@ async def _add_or_update_request_no_lock_async(request: Request):
                                        request.to_row())
 
 
-def set_request_failed(request_id: str, e: BaseException) -> None:
-    """Set a request to failed and populate the error message."""
+def set_exception_stacktrace(e: BaseException) -> None:
     with ux_utils.enable_traceback():
         stacktrace = traceback.format_exc()
     setattr(e, 'stacktrace', stacktrace)
+
+
+def set_request_failed(request_id: str, e: BaseException) -> None:
+    """Set a request to failed and populate the error message."""
+    set_exception_stacktrace(e)
     with update_request(request_id) as request_task:
         assert request_task is not None, request_id
         request_task.status = RequestStatus.FAILED
@@ -1054,9 +1067,7 @@ def set_request_failed(request_id: str, e: BaseException) -> None:
 @asyncio_utils.shield
 async def set_request_failed_async(request_id: str, e: BaseException) -> None:
     """Set a request to failed and populate the error message."""
-    with ux_utils.enable_traceback():
-        stacktrace = traceback.format_exc()
-    setattr(e, 'stacktrace', stacktrace)
+    set_exception_stacktrace(e)
     async with filelock.AsyncFileLock(request_lock_path(request_id)):
         request_task = await _get_request_no_lock_async(request_id)
         assert request_task is not None, request_id

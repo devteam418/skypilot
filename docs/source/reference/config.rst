@@ -88,6 +88,8 @@ Below is the configuration syntax and some example values. See detailed explanat
     :ref:`dws <config-yaml-kubernetes-dws>`:
       enabled: true
       max_run_duration: 10m
+    :ref:`post_provision_runcmd <config-yaml-kubernetes-post-provision-runcmd>`:
+      - echo "hello world!"
     :ref:`context_configs <config-yaml-kubernetes-context-configs>`:
       context1:
         pod_config:
@@ -98,6 +100,19 @@ Below is the configuration syntax and some example values. See detailed explanat
         remote_identity: my-k8s-service-account
 
   :ref:`ssh <config-yaml-ssh>`:
+    # See :ref:`kubernetes.pod_config <config-yaml-kubernetes-pod-config>` for more details.
+    pod_config: ...
+    # See :ref:`kubernetes.provision_timeout <config-yaml-kubernetes-provision-timeout>` for more details.
+    provision_timeout: ...
+    # Specifying above fields but for a specific context.
+    context_configs:
+      node-pool-1:
+        pod_config:
+          metadata:
+            labels:
+              my-label: my-value
+      node-pool-2:
+        provision_timeout: 3600
     :ref:`allowed_node_pools <config-yaml-ssh-allowed-node-pools>`:
       - node-pool-1
       - node-pool-2
@@ -118,6 +133,8 @@ Below is the configuration syntax and some example values. See detailed explanat
     :ref:`remote_identity <config-yaml-aws-remote-identity>`: LOCAL_CREDENTIALS
     :ref:`post_provision_runcmd <config-yaml-aws-post-provision-runcmd>`:
       - echo "hello world!"
+    :ref:`capabilities <config-yaml-aws-capabilities>`:
+      - storage
 
   :ref:`gcp <config-yaml-gcp>`:
     :ref:`labels <config-yaml-gcp-labels>`:
@@ -137,6 +154,8 @@ Below is the configuration syntax and some example values. See detailed explanat
     :ref:`enable_gvnic <config-yaml-gcp-enable-gvnic>`: false
     :ref:`enable_gpu_direct <config-yaml-gcp-enable-gpu-direct>`: false
     :ref:`placement_policy <config-yaml-gcp-placement-policy>`: compact
+    :ref:`capabilities <config-yaml-gcp-capabilities>`:
+      - storage
 
   :ref:`azure <config-yaml-azure>`:
     :ref:`resource_group_vm <config-yaml-azure-resource-group-vm>`: user-resource-group-name
@@ -173,6 +192,9 @@ Below is the configuration syntax and some example values. See detailed explanat
     :ref:`ssh_proxy_command <config-yaml-nebius-ssh-proxy-command>`: ssh -W %h:%p user@host
     :ref:`tenant_id <config-yaml-nebius-tenant-id>`: tenant-1234567890
     :ref:`domain <config-yaml-nebius-domain>`: api.nebius.cloud:443
+
+  :ref:`vast <config-yaml-vast>`:
+    :ref:`secure_only <config-yaml-vast-secure-only>`: true
 
   :ref:`rbac <config-yaml-rbac>`:
     :ref:`default_role <config-yaml-rbac-default-role>`: admin
@@ -873,6 +895,23 @@ Example:
       - echo "hello world!"
       - [ls, -l, /]
 
+.. _config-yaml-aws-capabilities:
+
+``aws.capabilities``
+~~~~~~~~~~~~~~~~~~~~
+
+Capabilities to enable for AWS. Used to enable specific features of AWS
+(e.g. only use AWS for S3 but not for launching VMs)
+
+Default: ``['compute', 'storage']``.
+
+Example:
+
+.. code-block:: yaml
+
+  aws:
+    capabilities:
+      - storage
 
 .. _config-yaml-gcp:
 
@@ -1120,6 +1159,26 @@ When `gcp.enable_gpu_direct` is enabled, the placement policy is automatically s
 
 Refer to the `GCP documentation <https://cloud.google.com/compute/docs/instances/placement-policies-overview>`_ for more information on placement policies.
 
+.. _config-yaml-gcp-capabilities:
+
+``gcp.capabilities``
+~~~~~~~~~~~~~~~~~~~~
+
+Capabilities to enable for the GCP.
+
+Used to enable specific features of GCP
+(e.g. only use GCP for GCS but not for launching VMs)
+
+Default: ``['compute', 'storage']``.
+
+Example:
+
+.. code-block:: yaml
+
+  gcp:
+    capabilities:
+      - storage
+
 .. _config-yaml-azure:
 
 ``azure``
@@ -1353,6 +1412,28 @@ Example:
       enabled: true
       max_run_duration: 10m
 
+.. _config-yaml-kubernetes-post-provision-runcmd:
+
+``kubernetes.post_provision_runcmd``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run commands during the instance initialization phase (optional).
+
+This is executed before any of the SkyPilot runtime setup commands, which is useful for doing any setup that must happen right after the instance starts, such as:
+
+- Configuring system settings
+- Installing certificates
+
+Each item is a string.
+
+Example:
+
+.. code-block:: yaml
+
+  kubernetes:
+    post_provision_runcmd:
+      - echo "hello world!"
+
 .. _config-yaml-kubernetes-context-configs:
 
 ``kubernetes.context_configs``
@@ -1579,6 +1660,24 @@ Example:
   nebius:
     domain: api.nebius.cloud:443
 
+.. _config-yaml-vast:
+
+``vast``
+~~~~~~~~
+
+Advanced Vast configuration (optional).
+
+.. _config-yaml-vast-secure-only:
+
+``vast.secure_only``
+~~~~~~~~~~~~~~~~~~~~
+
+Configure SkyPilot to only consider offers on Vast verified datacenters (optional).
+Internally, this will query Vast with the ``datacenters=true`` parameters. Note
+some GPUs may only be available on non-secure offers. This config can be
+overridden per task via :ref:`config flag <config-client-cli-flag>`.
+
+Default: ``false``
 
 .. _config-yaml-rbac:
 

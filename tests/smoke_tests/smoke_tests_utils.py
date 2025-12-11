@@ -74,16 +74,16 @@ LOW_CONTROLLER_RESOURCE_OVERRIDE_CONFIG = {
     'jobs': {
         'controller': {
             'resources': {
-                'cpus': '2+',
-                'memory': '4+'
+                'cpus': '4+',
+                'memory': '16+'
             }
         }
     },
     'serve': {
         'controller': {
             'resources': {
-                'cpus': '2+',
-                'memory': '4+'
+                'cpus': '4+',
+                'memory': '8+'
             }
         }
     }
@@ -362,7 +362,12 @@ class Test(NamedTuple):
 
 def get_timeout(generic_cloud: str,
                 override_timeout: int = DEFAULT_CMD_TIMEOUT):
-    timeouts = {'fluidstack': 60 * 60}  # file_mounts
+    timeouts = {
+        'fluidstack': 60 * 60,  # file_mounts
+        'slurm':
+            40 *
+            60  # Slurm uses NFS which is slower to write to for file_mounts tests
+    }
     return timeouts.get(generic_cloud, override_timeout)
 
 
@@ -551,7 +556,7 @@ def ensure_iterable_result(func):
 def run_one_test(test: Test, check_sky_status: bool = True) -> None:
     # Fail fast if `sky` CLI somehow errors out.
     if check_sky_status:
-        test.commands.insert(0, 'sky status')
+        test.commands.insert(0, 'sky status -u')
 
     log_to_stdout = os.environ.get('LOG_TO_STDOUT', None)
     if log_to_stdout:
@@ -772,6 +777,37 @@ VALIDATE_LAUNCH_OUTPUT_NO_PG_CONN_CLOSED_ERROR = (
     ' && echo "==Validating no pg conn closed error==" && '
     '! echo "$s" | grep -i "psycopg2.InterfaceError: connection already closed"'
 )
+
+
+def get_disk_size_and_validate_launch_output(generic_cloud: str):
+    """Get DISK_SIZE_PARAM and VALIDATE_LAUNCH_OUTPUT for a given cloud.
+
+    For RunPod, returns:
+    - DISK_SIZE_PARAM: '--disk-size 20'
+    - VALIDATE_LAUNCH_OUTPUT: Modified version with increased grep context
+      to handle RunPod's raw_response and banner output
+
+    For other clouds, returns:
+    - DISK_SIZE_PARAM: ''
+    - VALIDATE_LAUNCH_OUTPUT: Standard VALIDATE_LAUNCH_OUTPUT
+
+    Returns:
+        tuple: (DISK_SIZE_PARAM, VALIDATE_LAUNCH_OUTPUT)
+    """
+    if generic_cloud == 'runpod':
+        disk_size_param = '--disk-size 20'
+        # Use -A 10 instead of -A 1 for "Launching on" line to handle RunPod raw_response output
+        # Use -A 100 instead of -A 1 for "Job started. Streaming logs..." to handle RunPod banner output
+        validate_launch_output = (VALIDATE_LAUNCH_OUTPUT.replace(
+            'grep -A 1 "Launching on"', 'grep -A 10 "Launching on"').replace(
+                'grep -A 1 "Job started. Streaming logs..."',
+                'grep -A 100 "Job started. Streaming logs..."'))
+    else:
+        disk_size_param = ''
+        validate_launch_output = VALIDATE_LAUNCH_OUTPUT
+
+    return disk_size_param, validate_launch_output
+
 
 _CLOUD_CMD_CLUSTER_NAME_SUFFIX = '-cloud-cmd'
 
@@ -1014,7 +1050,7 @@ def get_dashboard_jobs_queue_request_id() -> str:
     return server_common.get_request_id(response)
 
 
-def get_response_from_request_id(request_id: str) -> Any:
+def get_response_from_request_id_dashboard(request_id: str) -> Any:
     """Waits for and gets the result of a request.
 
     Args:
@@ -1033,7 +1069,7 @@ def get_response_from_request_id(request_id: str) -> Any:
         'GET',
         f'/internal/dashboard/api/get?request_id={request_id}',
         server_url=get_api_server_url(),
-        timeout=15)
+        timeout=25)
     request_task = None
     if response.status_code == 200:
         request_task = requests_lib.Request.decode(
@@ -1104,14 +1140,16 @@ def is_in_buildkite_env() -> bool:
     return env_options.Options.RUNNING_IN_BUILDKITE.get()
 
 
-def get_avaliabe_gpus_for_k8s_tests(default_gpu: str = 'T4') -> str:
-    """Get the available GPUs for K8s."""
-    if is_remote_server_test():
+def get_available_gpus(default_gpu: str = 'T4',
+                       infra: str = 'kubernetes',
+                       count: int = 1) -> str:
+    """Get the available GPUs for K8s or Slurm."""
+    try:
         prefix = ''
         env_file = pytest_config_file_override()
         if env_file is not None:
             prefix = f'{skypilot_config.ENV_VAR_GLOBAL_CONFIG}={env_file}'
-        command = f'{prefix} sky show-gpus --infra kubernetes | grep -A1 "^GPU" | tail -1 | awk "{{print \$1}}"'
+        command = f'{prefix} sky show-gpus --infra {infra} | grep -A1 "^GPU" | grep " {count}" | tail -1 | awk "{{print \$1}}"'
         Test.echo_without_prefix(command)
         result = subprocess_utils.run(command,
                                       shell=True,
@@ -1120,7 +1158,9 @@ def get_avaliabe_gpus_for_k8s_tests(default_gpu: str = 'T4') -> str:
                                       text=True)
         gpu_name = result.stdout.strip()
         return gpu_name
-    return default_gpu
+    except Exception as e:
+        Test.echo_without_prefix(f'Error getting available GPUs: {e}')
+        return default_gpu
 
 
 def get_enabled_cloud_storages() -> List[clouds.Cloud]:
